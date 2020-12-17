@@ -47,7 +47,7 @@ class MBConvBlock(nn.Module):
         [3] https://arxiv.org/abs/1905.02244 (MobileNet v3)
     """
 
-    def __init__(self, block_args, global_params, image_size=None):
+    def __init__(self, block_args, global_params, cfg=None, image_size=None):
         super().__init__()
         self._block_args = block_args
         self._bn_mom = 1 - global_params.batch_norm_momentum # pytorch's difference from tensorflow
@@ -58,10 +58,19 @@ class MBConvBlock(nn.Module):
         # Expansion phase (Inverted Bottleneck)
         inp = self._block_args.input_filters  # number of input channels
         oup = self._block_args.input_filters * self._block_args.expand_ratio  # number of output channels
+        if cfg is not None:
+            inp = cfg[0]
+            oup = cfg[1]
+
         if self._block_args.expand_ratio != 1:
             Conv2d = get_same_padding_conv2d(image_size=image_size)
             self._expand_conv = Conv2d(in_channels=inp, out_channels=oup, kernel_size=1, bias=False)
             self._bn0 = nn.BatchNorm2d(num_features=oup, momentum=self._bn_mom, eps=self._bn_eps)
+            if cfg is not None:
+                assert cfg[1] == cfg[2]
+        else:
+            if cfg is not None:
+                assert cfg[0] == cfg[1]
             # image_size = calculate_output_image_size(image_size, 1) <-- this wouldn't modify image_size
 
         # Depthwise convolution phase
@@ -83,6 +92,8 @@ class MBConvBlock(nn.Module):
 
         # Pointwise convolution phase
         final_oup = self._block_args.output_filters
+        if cfg is not None:
+            final_oup = cfg[-1]
         Conv2d = get_same_padding_conv2d(image_size=image_size)
         self._project_conv = Conv2d(in_channels=oup, out_channels=final_oup, kernel_size=1, bias=False)
         self._bn2 = nn.BatchNorm2d(num_features=final_oup, momentum=self._bn_mom, eps=self._bn_eps)
@@ -162,12 +173,13 @@ class EfficientNet(nn.Module):
         >>> outputs = model(inputs)
     """
 
-    def __init__(self, blocks_args=None, global_params=None):
+    def __init__(self, blocks_args=None, global_params=None, cfg=None):
         super().__init__()
         assert isinstance(blocks_args, list), 'blocks_args should be a list'
         assert len(blocks_args) > 0, 'block args must be greater than 0'
         self._global_params = global_params
         self._blocks_args = blocks_args
+
 
         # Batch norm parameters
         bn_mom = 1 - self._global_params.batch_norm_momentum
@@ -180,33 +192,58 @@ class EfficientNet(nn.Module):
         # Stem
         in_channels = 3  # rgb
         out_channels = round_filters(32, self._global_params)  # number of output channels
+        if cfg is not None:
+            out_channels = cfg[0]
+
         self._conv_stem = Conv2d(in_channels, out_channels, kernel_size=3, stride=2, bias=False)
         self._bn0 = nn.BatchNorm2d(num_features=out_channels, momentum=bn_mom, eps=bn_eps)
         image_size = calculate_output_image_size(image_size, 2)
 
         # Build blocks
         self._blocks = nn.ModuleList([])
+        cfg_idx = 1
         for block_args in self._blocks_args:
-
             # Update block input and output filters based on depth multiplier.
             block_args = block_args._replace(
                 input_filters=round_filters(block_args.input_filters, self._global_params),
                 output_filters=round_filters(block_args.output_filters, self._global_params),
                 num_repeat=round_repeats(block_args.num_repeat, self._global_params)
             )
-
+            sub_cfg = None
             # The first block needs to take care of stride and filter size increase.
-            self._blocks.append(MBConvBlock(block_args, self._global_params, image_size=image_size))
+            if cfg is not None:
+                if block_args.expand_ratio != 1:
+                    sub_cfg = cfg[cfg_idx-1:cfg_idx+3]
+                    cfg_idx = cfg_idx + 3
+                else:
+                    assert cfg[cfg_idx - 1] == cfg[cfg_idx]
+                    sub_cfg = cfg[cfg_idx-1:cfg_idx+2]
+                    cfg_idx = cfg_idx + 2
+            self._blocks.append(MBConvBlock(block_args, self._global_params, cfg=sub_cfg, image_size=image_size))
             image_size = calculate_output_image_size(image_size, block_args.stride)
             if block_args.num_repeat > 1: # modify block_args to keep same output size
                 block_args = block_args._replace(input_filters=block_args.output_filters, stride=1)
             for _ in range(block_args.num_repeat - 1):
-                self._blocks.append(MBConvBlock(block_args, self._global_params, image_size=image_size))
+                if cfg is not None:
+                    if block_args.expand_ratio != 1:
+                        sub_cfg = cfg[cfg_idx-1:cfg_idx+3]
+                        cfg_idx = cfg_idx + 3
+                    else:
+                        assert cfg[cfg_idx - 1] == cfg[cfg_idx]
+                        sub_cfg = cfg[cfg_idx-1:cfg_idx+2]
+                        cfg_idx = cfg_idx + 2
+                #print(sub_cfg)
+                self._blocks.append(MBConvBlock(block_args, self._global_params, cfg=sub_cfg, image_size=image_size))
                 # image_size = calculate_output_image_size(image_size, block_args.stride)  # stride = 1
 
         # Head
         in_channels = block_args.output_filters  # output of final block
         out_channels = round_filters(1280, self._global_params)
+
+        if cfg is not None:
+            in_channels = cfg[-2]
+            out_channels = cfg[-1]
+
         Conv2d = get_same_padding_conv2d(image_size=image_size)
         self._conv_head = Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
         self._bn1 = nn.BatchNorm2d(num_features=out_channels, momentum=bn_mom, eps=bn_eps)
@@ -318,7 +355,7 @@ class EfficientNet(nn.Module):
         return x
 
     @classmethod
-    def from_name(cls, model_name, in_channels=3, **override_params):
+    def from_name(cls, model_name, in_channels=3, cfg=None, **override_params):
         """create an efficientnet model according to name.
 
         Args:
@@ -338,9 +375,26 @@ class EfficientNet(nn.Module):
         """
         cls._check_model_name_is_valid(model_name)
         blocks_args, global_params = get_model_params(model_name, override_params)
-        model = cls(blocks_args, global_params)
+        model = cls(blocks_args, global_params, cfg=cfg)
         model._change_in_channels(in_channels)
         return model
+
+    @classmethod
+    def from_name_pruned(cls, model_name, state_dict_path=None, override_params=None):
+        cls._check_model_name_is_valid(model_name)
+        assert state_dict_path is not None
+        state_dict = torch.load(state_dict_path)
+        if "state_dict" in state_dict:
+            state_dict = state_dict["state_dict"]
+        tmp_dict = dict()
+        for k, v in state_dict.items():
+            tmp_dict[k.replace("module.", "")] = v
+        state_dict = tmp_dict
+        cfg = [state_dict[key].shape[0] for key in state_dict.keys() if "bn" in key and "weight" in key] #insertion order preserved
+        blocks_args, global_params = get_model_params(model_name, override_params)
+        ret = cls(blocks_args, global_params, cfg=cfg)
+        ret.load_state_dict(state_dict)
+        return ret
 
     @classmethod
     def from_pretrained(cls, model_name, weights_path=None, advprop=False,
